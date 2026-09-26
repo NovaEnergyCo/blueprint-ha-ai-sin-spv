@@ -23,10 +23,15 @@ blueprint:
           integration: workday
     motion:
       name: Sensores de movimiento / presencia
-      description: Si hay varios, basta con que uno detecte para considerar el aula ocupada.
+      description: >
+        Sensores de movimiento o contactos secos (on = hay movimiento, off = no hay).
+        Si hay varios, basta con que uno esté en on para considerar el aula ocupada.
       selector:
         entity:
-          domain: binary_sensor
+          domain:
+            - binary_sensor
+            - switch
+            - input_boolean
           multiple: true
     start_time:
       name: Hora de encendido
