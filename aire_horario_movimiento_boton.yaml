@@ -6,6 +6,8 @@ blueprint:
     - Dentro de la franja, en día hábil y con el aire encendido:
       movimiento = temperatura ocupada (23 °C), sin movimiento = temperatura vacía (26 °C).
       El movimiento NUNCA enciende el aire, solo ajusta la temperatura.
+    - Fuera del horario hábil (fuera de la franja o con Workday apagado): si el aire
+      está encendido y no hay movimiento durante el tiempo configurado, lo apaga.
     - Tercer botón del interruptor: si el botón enciende, enciende el aire a 23 °C;
       si el botón apaga, apaga el aire. Funciona a cualquier hora.
   domain: automation
@@ -62,8 +64,10 @@ blueprint:
           step: 0.5
           unit_of_measurement: "°C"
     no_motion_delay:
-      name: Tiempo sin movimiento antes de subir a temperatura vacía
-      description: Se suma al tiempo de liberación propio del sensor.
+      name: Tiempo sin movimiento
+      description: >
+        Tiempo sin movimiento para subir a la temperatura vacía (en horario hábil)
+        o para apagar el aire (fuera del horario hábil).
       default:
         minutes: 5
       selector:
@@ -90,10 +94,10 @@ blueprint:
             - light
             - input_boolean
     sync_button:
-      name: Sincronizar el botón con el horario
+      name: Sincronizar el botón con el aire
       description: >
-        Cuando el horario enciende o apaga el aire, pone el botón en el mismo estado,
-        para que la siguiente pulsación haga lo que el usuario espera.
+        Cuando la automatización enciende o apaga el aire, pone el botón en el mismo
+        estado, para que la siguiente pulsación haga lo que el usuario espera.
       default: true
       selector:
         boolean: {}
@@ -109,7 +113,18 @@ variables:
   temp_occupied: !input temp_occupied
   temp_empty: !input temp_empty
   hvac_mode: !input hvac_mode
+  delay_input: !input no_motion_delay
+  delay_seconds: >
+    {{ (delay_input.hours | default(0) | int) * 3600
+       + (delay_input.minutes | default(0) | int) * 60
+       + (delay_input.seconds | default(0) | int) }}
   occupied: "{{ motion_sensors | select('is_state', 'on') | list | count > 0 }}"
+  # Ningún sensor en on y todos llevan al menos el tiempo configurado sin movimiento
+  empty_long_enough: >
+    {{ not occupied and
+       expand(motion_sensors)
+         | selectattr('last_changed', 'gt', now() - timedelta(seconds=delay_seconds | int))
+         | list | count == 0 }}
   target_temp: "{{ temp_occupied if occupied else temp_empty }}"
 
 triggers:
@@ -122,12 +137,21 @@ triggers:
   - trigger: state
     entity_id: !input motion
     to: "on"
-    id: motion
+    id: motion_on
   - trigger: state
     entity_id: !input motion
     to: "off"
     for: !input no_motion_delay
-    id: motion
+    id: motion_off
+  # Aire encendido (p. ej. con el botón) sin que nadie se mueva después
+  - trigger: state
+    entity_id: !input thermostat
+    from: "off"
+    not_to:
+      - unavailable
+      - unknown
+    for: !input no_motion_delay
+    id: ac_on
   - trigger: state
     entity_id: !input button
     from: "off"
@@ -180,7 +204,9 @@ actions:
       # 3) Ajuste por movimiento dentro de la franja hábil (no enciende el aire)
       - conditions:
           - condition: trigger
-            id: motion
+            id:
+              - motion_on
+              - motion_off
           - condition: state
             entity_id: !input workday
             state: "on"
@@ -197,6 +223,38 @@ actions:
               entity_id: "{{ thermostat }}"
             data:
               temperature: "{{ target_temp }}"
+
+      # 5) Fuera del horario hábil: sin movimiento durante el tiempo configurado -> apagar
+      - conditions:
+          - condition: trigger
+            id:
+              - motion_off
+              - ac_on
+          - condition: not
+            conditions:
+              - condition: and
+                conditions:
+                  - condition: state
+                    entity_id: !input workday
+                    state: "on"
+                  - condition: time
+                    after: !input start_time
+                    before: !input end_time
+          - condition: template
+            value_template: >
+              {{ states(thermostat) not in ['off', 'unavailable', 'unknown']
+                 and empty_long_enough }}
+        sequence:
+          - action: climate.set_hvac_mode
+            target:
+              entity_id: "{{ thermostat }}"
+            data:
+              hvac_mode: "off"
+          - if: "{{ sync_button and not is_state(button, 'off') }}"
+            then:
+              - action: homeassistant.turn_off
+                target:
+                  entity_id: "{{ button }}"
 
       # 4) Botón enciende -> aire encendido a 23 °C
       #    (se ignoran los cambios del botón hechos por esta misma automatización)
